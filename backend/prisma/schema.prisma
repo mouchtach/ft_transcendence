@@ -1,0 +1,346 @@
+// PROPOSED schema. Merge with the User/auth models already written by the auth teammate.
+// Rule: keep their column names for anything auth already uses, add the rest.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────── Enums ─────────────
+enum RoleName {
+  CUSTOMER
+  AGENCY_EMPLOYEE
+  AGENCY_MANAGER
+  AGENCY_ADMIN
+  SUPER_ADMIN
+}
+
+enum AccountStatus {
+  ACTIVE
+  BANNED
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum CarStatus {
+  AVAILABLE
+  RESERVED
+  RENTED
+  MAINTENANCE
+  UNAVAILABLE
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  REJECTED
+  CANCELLED
+  ACTIVE
+  COMPLETED
+}
+
+enum FriendStatus {
+  PENDING
+  ACCEPTED
+  BLOCKED
+}
+
+enum ConversationType {
+  DIRECT
+  SUPPORT
+}
+
+enum NotificationType {
+  BOOKING_CREATED
+  BOOKING_CONFIRMED
+  BOOKING_REJECTED
+  BOOKING_CANCELLED
+  CAR_STATUS_CHANGED
+  FRIEND_REQUEST
+  FRIEND_ACCEPTED
+  NEW_MESSAGE
+  AGENCY_VERIFIED
+  SYSTEM
+}
+
+enum AuditAction {
+  VERIFY
+  REJECT
+  BAN
+  UNBAN
+  SUPPORT_MESSAGE
+}
+
+// ───────────── Users, auth, permissions ─────────────
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  username     String        @unique
+  displayName  String
+  passwordHash String?       // null for OAuth-only accounts
+  avatarUrl    String?
+  language     String        @default("en")
+  status       AccountStatus @default(ACTIVE)
+  banReason    String?
+  lastSeenAt   DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  roleId String
+  role   Role   @relation(fields: [roleId], references: [id])
+
+  employee      Employee?
+  oauthAccounts OAuthAccount[]
+  refreshTokens RefreshToken[]
+  bookings      Booking[]      @relation("BookingCustomer")
+  decidedBookings Booking[]    @relation("BookingDecidedBy")
+  reviews       Review[]
+  notifications Notification[]
+  sentMessages  Message[]
+  memberships   ConversationMember[]
+  friendsSent     Friendship[] @relation("FriendRequester")
+  friendsReceived Friendship[] @relation("FriendAddressee")
+  auditAsAdmin    AuditLog[]   @relation("AuditAdmin")
+  auditAsTarget   AuditLog[]   @relation("AuditTarget")
+}
+
+model OAuthAccount {
+  id         String  @id @default(uuid())
+  userId     String
+  provider   String  // "google"
+  providerId String
+  user       User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerId])
+  @@index([userId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Role {
+  id          String           @id @default(uuid())
+  name        RoleName         @unique
+  users       User[]
+  permissions RolePermission[]
+}
+
+model Permission {
+  id    String           @id @default(uuid())
+  key   String           @unique // e.g. "car:create", "booking:decide", "analytics:read"
+  roles RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+// ───────────── Agencies ─────────────
+model Agency {
+  id           String             @id @default(uuid())
+  name         String             @unique
+  city         String
+  phone        String?
+  verification VerificationStatus @default(PENDING)
+  createdAt    DateTime           @default(now())
+
+  employees Employee[]
+  cars      Car[]
+  bookings  Booking[]
+}
+
+// A user who works for an agency (their permissions come from User.role)
+model Employee {
+  id       String   @id @default(uuid())
+  userId   String   @unique
+  agencyId String
+  hiredAt  DateTime @default(now())
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agency   Agency   @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+}
+
+// ───────────── Cars, tracking ─────────────
+model Car {
+  id           String    @id @default(uuid())
+  agencyId     String
+  brand        String
+  model        String
+  year         Int
+  category     String    // Economy, Compact, SUV, Van, Luxury
+  city         String
+  description  String?
+  pricePerDay  Int       // MAD, integer
+  fuelType     String    // Petrol, Diesel, Hybrid, Electric
+  transmission String    // Manual, Automatic
+  seats        Int
+  licensePlate String    @unique
+  status       CarStatus @default(AVAILABLE)
+  imageUrl     String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  agency    Agency     @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  bookings  Booking[]
+  locations Location[]
+  reviews   Review[]
+
+  @@index([agencyId])
+  @@index([city, category, pricePerDay])
+}
+
+model Location {
+  id         BigInt   @id @default(autoincrement())
+  carId      String
+  latitude   Float
+  longitude  Float
+  speed      Float    @default(0)
+  recordedAt DateTime @default(now())
+  car        Car      @relation(fields: [carId], references: [id], onDelete: Cascade)
+
+  @@index([carId, recordedAt(sort: Desc)])
+}
+
+// ───────────── Bookings, reviews ─────────────
+model Booking {
+  id          String        @id @default(uuid())
+  customerId  String
+  carId       String
+  agencyId    String        // denormalised from car: fast agency filters + analytics
+  startDate   DateTime      @db.Date
+  endDate     DateTime      @db.Date
+  days        Int
+  pricePerDay Int           // snapshot at booking time
+  totalPrice  Int           // computed by the SERVER only
+  status      BookingStatus @default(PENDING)
+  decidedById String?
+  decidedAt   DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  customer  User    @relation("BookingCustomer", fields: [customerId], references: [id])
+  decidedBy User?   @relation("BookingDecidedBy", fields: [decidedById], references: [id])
+  car       Car     @relation(fields: [carId], references: [id])
+  agency    Agency  @relation(fields: [agencyId], references: [id])
+  review    Review?
+
+  @@index([customerId])
+  @@index([carId, startDate, endDate])
+  @@index([agencyId, status])
+}
+
+model Review {
+  id        String   @id @default(uuid())
+  userId    String
+  carId     String
+  bookingId String   @unique // one review per completed booking
+  rating    Int      // 1..5 (CHECK constraint in SQL migration)
+  comment   String?
+  createdAt DateTime @default(now())
+
+  user    User    @relation(fields: [userId], references: [id])
+  car     Car     @relation(fields: [carId], references: [id], onDelete: Cascade)
+  booking Booking @relation(fields: [bookingId], references: [id])
+
+  @@index([carId])
+}
+
+// ───────────── Social, chat, notifications ─────────────
+model Friendship {
+  id          String       @id @default(uuid())
+  requesterId String
+  addresseeId String
+  status      FriendStatus @default(PENDING)
+  createdAt   DateTime     @default(now())
+
+  requester User @relation("FriendRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  addressee User @relation("FriendAddressee", fields: [addresseeId], references: [id], onDelete: Cascade)
+
+  @@unique([requesterId, addresseeId])
+  @@index([addresseeId])
+}
+
+model Conversation {
+  id        String           @id @default(uuid())
+  type      ConversationType @default(DIRECT)
+  createdAt DateTime         @default(now())
+
+  members  ConversationMember[]
+  messages Message[]
+}
+
+model ConversationMember {
+  conversationId String
+  userId         String
+  lastReadAt     DateTime?
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([conversationId, userId])
+  @@index([userId])
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  conversationId String
+  senderId       String
+  content        String
+  createdAt      DateTime @default(now())
+  readAt         DateTime?
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User         @relation(fields: [senderId], references: [id])
+
+  @@index([conversationId, createdAt])
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  type      NotificationType
+  title     String
+  body      String
+  data      Json?            // e.g. { "bookingId": "..." } for deep links
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt])
+}
+
+// ───────────── Admin audit ─────────────
+model AuditLog {
+  id        String      @id @default(uuid())
+  adminId   String
+  targetId  String
+  action    AuditAction
+  reason    String?
+  createdAt DateTime    @default(now())
+  admin     User        @relation("AuditAdmin", fields: [adminId], references: [id])
+  target    User        @relation("AuditTarget", fields: [targetId], references: [id])
+
+  @@index([createdAt])
+}

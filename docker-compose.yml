@@ -1,0 +1,54 @@
+# FleetFlow: 3 containers. Only the frontend (nginx) is exposed, over HTTPS.
+#   docker compose up --build   ->   https://localhost:8443
+
+services:
+  database:
+    image: postgres:16-alpine
+    container_name: fleetflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [internal]
+    # no "ports": the database is never reachable from outside Docker
+
+  backend:
+    build: ./backend
+    container_name: fleetflow-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}?schema=public
+      PORT: 3000
+    depends_on:
+      database:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/uploads
+    networks: [internal]
+    # no "ports": reached only through nginx (/api, /socket.io, /uploads)
+
+  frontend:
+    build: ./frontend
+    container_name: fleetflow-web
+    restart: unless-stopped
+    depends_on: [backend]
+    ports:
+      - "8443:443"
+      - "8080:80"   # redirects to HTTPS
+    networks: [internal]
+
+volumes:
+  pgdata:
+  uploads:
+
+networks:
+  internal:
